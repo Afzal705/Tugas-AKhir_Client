@@ -19,6 +19,19 @@ public interface AudioCodec {
      */
     int encode(int pcm16);
 
+    /**
+     * Mendekodekan satu kode (nibble mentah, unsigned [0-15] hasil unpack
+     * byte) menjadi sampel PCM 16-bit hasil rekonstruksi. Setiap
+     * implementasi bertanggung jawab menafsirkan representasi tandanya
+     * sendiri (mis. DPCM perlu sign-extend nibble ke [-8,7] sebelum
+     * diproses, ADPCM G.726 tidak perlu karena kodenya memang unsigned
+     * 0-15).
+     *
+     * @param code nibble mentah [0-15] yang diterima dari jaringan
+     * @return sampel PCM 16-bit hasil rekonstruksi
+     */
+    int decode(int code);
+
     /** Jumlah bit per sampel hasil kompresi (dipakai untuk packing byte). */
     int getBitsPerSample();
 

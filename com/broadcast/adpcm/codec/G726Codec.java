@@ -70,6 +70,53 @@ public final class G726Codec {
     }
 
     // =========================================================
+    // DECODE — kode ADPCM 4-bit → PCM 16-bit
+    // =========================================================
+
+    /**
+     * Mendekodekan satu kode ADPCM 4-bit menjadi sampel PCM 16-bit.
+     *
+     * Menggunakan PERSIS jalur feedback yang sama dengan encode()
+     * (Blok 4,5,6,7,8,9) — bedanya di sini kode I datang dari jaringan,
+     * bukan dari hasil quantize() atas sinyal asli. State HARUS
+     * diinisialisasi terpisah dari state encoder manapun, dan dipanggil
+     * berurutan sesuai urutan kode yang diterima agar tetap sinkron
+     * (implicit synchronization, prinsip standar ADPCM).
+     *
+     * @param code   kode ADPCM 4-bit [0-15] hasil terima dari jaringan
+     * @param state  state codec (terpisah dari state encoder manapun)
+     * @return       sampel PCM 16-bit hasil rekonstruksi
+     */
+    public static int decode(int code, G726State state) {
+        int I = code & 0xF;
+
+        // Blok 6: prediksi (identik dengan encode)
+        int sezi = predictorZero(state);
+        int sez  = sezi >> 1;
+        int sei  = sezi + predictorPole(state);
+        int se   = sei >> 1;
+
+        // Blok 7: step size (identik dengan encode)
+        int y = stepSize(state);
+
+        // Blok 4: inverse quantizer — di sinilah bedanya dengan encode:
+        // I datang langsung dari kode diterima, bukan dari quantize(d, y)
+        int dq = ssxreconstruct(I & 8, G726Tables.DQLN_TABLE[I], y);
+
+        // Blok 5: sinyal rekonstruksi
+        int sr = (dq < 0) ? se - (dq & 0x3FFF) : se + dq;
+
+        // Blok 6,7,8,9: update state — WAJIB identik urutannya dengan encode
+        int dqsez = sr + sez - se;
+        update(y, G726Tables.WI_TABLE[I], G726Tables.FI_TABLE[I],
+               dq, sr, dqsez, state);
+
+        // Inverse Blok 1: skala 13-bit kembali ke 16-bit
+        int pcm16 = sr << 3;
+        return Math.max(-32768, Math.min(32767, pcm16));
+    }
+
+    // =========================================================
     // BLOK 6A — Predictor Zero (filter FIR, koefisien b[])
     // =========================================================
 

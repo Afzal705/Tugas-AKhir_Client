@@ -17,6 +17,13 @@ public final class G726CodecAdapter implements AudioCodec {
     }
 
     @Override
+    public int decode(int code) {
+        // Kode G.726 memang unsigned 0-15 apa adanya, tidak perlu
+        // sign-extend seperti DPCM.
+        return G726Codec.decode(code, state);
+    }
+
+    @Override
     public int getBitsPerSample() {
         return 4;
     }
