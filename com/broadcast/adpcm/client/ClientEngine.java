@@ -16,6 +16,7 @@ import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.SourceDataLine;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.TreeMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,9 +28,33 @@ import java.util.concurrent.atomic.AtomicLong;
  * ClientEngine.java
  *
  * Pasangan BroadcastEngine di sisi server, tapi untuk sisi penerima.
- * Pipeline utama: terima paket UDP -> parse -> catat QoS -> decode (skip
- * sync tone di awal sesi) -> (opsional) putar ke speaker & (opsional)
+ * Pipeline utama: terima paket UDP -> masukkan ke JITTER BUFFER (urutkan
+ * berdasarkan sequenceNumber) -> keluarkan berurutan -> catat QoS -> decode
+ * (skip sync tone di awal sesi) -> (opsional) putar ke speaker & (opsional)
  * simpan PCM hasil decode.
+ *
+ * =========================================================================
+ * PERBAIKAN PENTING (root cause dengung + crackling + clipping):
+ * =========================================================================
+ * G.726 adalah codec PREDIKTIF-BERURUTAN: setiap sampel didecode berdasarkan
+ * state (predictor a[]/b[], step size yu/yl) hasil sampel-sampel sebelumnya.
+ * UDP TIDAK menjamin urutan maupun keberhasilan pengiriman paket. Versi
+ * sebelumnya langsung men-decode paket dalam URUTAN KEDATANGAN (bukan
+ * urutan pengiriman), sehingga:
+ *   - Paket yang datang tidak berurutan (reordering, umum di WiFi) membuat
+ *     decoder mengadaptasi predictor/step-size ke arah yang salah untuk
+ *     beberapa saat -> terdengar sebagai DENGUNG yang menetap.
+ *   - Paket yang hilang membuat state "melompat" tanpa transisi -> terdengar
+ *     sebagai KRESEK-KRESEK/CRACKLING setiap kali ada loss.
+ *   - Kombinasi keduanya berulang membuat predictor kadang overshoot ->
+ *     CLIPPING sesekali.
+ *
+ * Solusi: jitterBuffer (TreeMap<sequenceNumber, PacketInfo>) menahan paket
+ * sampai gilirannya (nextExpectedSeq) tiba, sehingga codec.decode() SELALU
+ * menerima kode dalam urutan asli seperti saat di-encode di server. Kalau
+ * paket memang hilang (bukan cuma telat), concealMissingFrame() mengumpankan
+ * kode "delta netral" (bukan diam) supaya predictor meluruh mulus menuju
+ * hening, bukan membeku lalu meloncat kasar saat data asli datang lagi.
  *
  * CATATAN KRITIS - SYNC TONE:
  * Server mengirim sync tone (1000Hz, 200ms) di awal SETIAP sesi memakai
@@ -47,7 +72,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * dilempar ke codec.decode() sama sekali (bukan sekadar dibuang hasilnya)
  * supaya state codec tidak tersentuh. Penghitungan berbasis sampel (bukan
  * paket) sengaja dipilih supaya tetap benar walau satu paket berisi lebih
- * dari satu frame, atau batas sync-tone jatuh di tengah suatu paket.
+ * dari satu frame, atau batas sync-tone jatuh di tengah suatu paket. Logika
+ * ini TETAP DIPERTAHANKAN UTUH di decodeAndOutput()/handleNibble() - jitter
+ * buffer hanya mengatur URUTAN paket sebelum sampai ke logika ini, jadi
+ * concealMissingFrame() pun dibuat lewat decodeAndOutput() yang sama supaya
+ * skip-counter sync tone tetap konsisten walau ada paket hilang di awal sesi.
  *
  * CATATAN BIT-PACKING (harus sama persis dengan
  * BroadcastEngine.processAudioChunk() di server):
@@ -61,11 +90,28 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * Heartbeat packet (payload kosong, byte[0]) TIDAK didecode, tapi TETAP
  * dicatat ke QosMetrics karena tetap relevan untuk packet loss/jitter.
+ * PENTING: heartbeat JUGA memakai sequenceNumber dari counter yang sama
+ * dengan paket audio (lihat BroadcastEngine.startHeartbeatSender()), jadi
+ * heartbeat juga harus melewati jitter buffer & tetap memajukan
+ * nextExpectedSeq - kalau tidak, urutan akan salah sangka ada paket audio
+ * yang hilang padahal yang "hilang" itu sebenarnya slot heartbeat.
  */
 public final class ClientEngine {
 
     // Harus sama persis dengan BroadcastEngine.SYNC_TONE_DURATION_MS di server
     private static final int SYNC_TONE_DURATION_MS = 200;
+
+    // Ukuran jitter buffer dalam JUMLAH PAKET. Paket ditahan sampai
+    // gilirannya tiba, atau sampai buffer penuh (dianggap hilang permanen).
+    // 4 paket x 10ms/frame = ~40ms toleransi keterlambatan/reordering -
+    // cukup untuk LAN/WiFi tanpa menambah delay yang terasa untuk voice.
+    private static final int JITTER_BUFFER_PACKETS = 4;
+
+    // Kode ADPCM "netral" dipakai saat concealment (paket hilang permanen).
+    // Untuk skema 4-bit G.726 asimetris, kode di tengah rentang magnitude
+    // dipakai sebagai pendekatan delta kecil non-granular, supaya predictor
+    // meluruh halus menuju hening alih-alih dipaksa diam total.
+    private static final int CONCEALMENT_CODE = 6;
 
     private final ClientConfig config;
     private final AudioConfig audioConfig;
@@ -76,6 +122,10 @@ public final class ClientEngine {
     // Jumlah sampel yang masih harus dibuang (sisa sync tone di awal sesi).
     // Hanya disentuh oleh receiveThread, tidak perlu atomic.
     private int samplesToSkip;
+
+    // ===== JITTER BUFFER (hanya disentuh oleh receiveThread) =====
+    private final TreeMap<Integer, PacketInfo> jitterBuffer = new TreeMap<>();
+    private Integer nextExpectedSeq = null; // null = belum terinisialisasi
 
     private SourceDataLine playbackLine;
     private FileOutputStream pcmFileOut;
@@ -89,6 +139,7 @@ public final class ClientEngine {
     private final AtomicInteger packetsReceived  = new AtomicInteger(0);
     private final AtomicInteger heartbeatsSeen   = new AtomicInteger(0);
     private final AtomicInteger malformedPackets = new AtomicInteger(0);
+    private final AtomicInteger concealedFrames  = new AtomicInteger(0);
     private final AtomicLong    samplesDecoded   = new AtomicLong(0);
     private long startTime;
 
@@ -115,6 +166,8 @@ public final class ClientEngine {
         AppLogger.info(String.format(
             "Sync tone skip: %d sampel (%dms @ %dHz)",
             samplesToSkip, SYNC_TONE_DURATION_MS, audioConfig.getSampleRate()));
+        AppLogger.info("Jitter buffer: " + JITTER_BUFFER_PACKETS + " paket (~"
+            + (JITTER_BUFFER_PACKETS * audioConfig.getFrameSizeMs()) + "ms toleransi)");
 
         if (config.isEnablePlayback()) {
             initializePlayback();
@@ -225,6 +278,9 @@ public final class ClientEngine {
             }
         }
 
+        jitterBuffer.clear();
+        nextExpectedSeq = null;
+
         qosMetrics.close();
 
         printStats();
@@ -242,17 +298,26 @@ public final class ClientEngine {
         while (isRunning.get()) {
             byte[] raw = receiver.receivePacket();
             if (raw == null) {
-                // timeout (SO_TIMEOUT di UDPBroadcastReceiver) - normal, loop
-                // lagi supaya flag isRunning dicek berkala
+                // timeout (SO_TIMEOUT di UDPBroadcastReceiver) - normal. Tetap
+                // coba flush, supaya paket yang sudah menunggu lama di buffer
+                // tidak macet menunggu paket yang mungkin memang tidak akan
+                // pernah datang.
+                flushReadyPackets();
                 continue;
             }
-            processPacket(raw);
+            bufferPacket(raw);
+            flushReadyPackets();
         }
 
         AppLogger.info("Receive loop ended");
     }
 
-    private void processPacket(byte[] raw) {
+    /**
+     * Parse paket mentah, catat ke QoS, lalu masukkan ke jitter buffer
+     * (TreeMap otomatis mengurutkan berdasarkan sequenceNumber sebagai key).
+     * TIDAK langsung decode di sini - urutan dijamin oleh flushReadyPackets().
+     */
+    private void bufferPacket(byte[] raw) {
         long receiveTimeMillis = System.currentTimeMillis();
 
         PacketInfo info;
@@ -264,13 +329,79 @@ public final class ClientEngine {
             return;
         }
 
-        // Catat ke QoS SELALU - termasuk heartbeat (payload kosong), karena
-        // tetap relevan untuk packet loss/jitter tracking.
         qosMetrics.recordPacket(info, receiveTimeMillis);
         packetsReceived.incrementAndGet();
 
+        if (nextExpectedSeq == null) {
+            // Paket pertama yang diterima di sesi ini - mulai hitung dari sini,
+            // apa pun nilai sequenceNumber-nya (server mungkin sudah mengirim
+            // sync tone sebelumnya dengan seq yang berjalan duluan).
+            nextExpectedSeq = info.sequenceNumber;
+        }
+
+        // Paket yang datang jauh lebih telat dari window jitter buffer -
+        // slotnya sudah pasti ter-concealment duluan, buang saja.
+        if (seqDistance(info.sequenceNumber, nextExpectedSeq) < 0
+                && seqDistance(nextExpectedSeq, info.sequenceNumber) > JITTER_BUFFER_PACKETS) {
+            return;
+        }
+
+        jitterBuffer.put(info.sequenceNumber, info);
+    }
+
+    /**
+     * Selisih seq (a - b) dengan toleransi wraparound 32-bit, supaya tetap
+     * benar saat sequenceNumber overflow dan kembali ke 0 (disebutkan di
+     * SimplePacketFormatter: "wrap around allowed").
+     */
+    private static int seqDistance(int a, int b) {
+        return a - b; // overflow int otomatis berperilaku modulo 2^32 - benar untuk wraparound
+    }
+
+    /**
+     * Keluarkan paket dari jitter buffer secara BERURUTAN sesuai
+     * nextExpectedSeq. Kalau paket yang ditunggu belum datang tapi buffer
+     * sudah cukup penuh (menandakan paket itu memang hilang, bukan sekadar
+     * telat dikit), lakukan concealment lalu tetap maju ke slot berikutnya -
+     * supaya decoder tidak pernah menerima kode di luar urutan aslinya.
+     */
+    private void flushReadyPackets() {
+        while (!jitterBuffer.isEmpty()) {
+            int lowestSeq = jitterBuffer.firstKey();
+            int distance  = seqDistance(lowestSeq, nextExpectedSeq);
+
+            if (distance == 0) {
+                // Paket yang ditunggu sudah ada - proses sekarang.
+                PacketInfo info = jitterBuffer.remove(lowestSeq);
+                dispatchPacket(info);
+                nextExpectedSeq++;
+
+            } else if (distance < 0) {
+                // Paket "basi" (seq lebih kecil dari yang sudah diproses/
+                // di-concealment) - duplikat atau nyasar, buang saja.
+                jitterBuffer.remove(lowestSeq);
+
+            } else if (jitterBuffer.size() >= JITTER_BUFFER_PACKETS) {
+                // Buffer sudah penuh menunggu, paket nextExpectedSeq dianggap
+                // hilang permanen - lakukan concealment lalu maju.
+                concealMissingFrame();
+                concealedFrames.incrementAndGet();
+                nextExpectedSeq++;
+
+            } else {
+                // Masih dalam toleransi jitter - mungkin cuma telat dikit,
+                // tunggu paket berikutnya datang dulu.
+                break;
+            }
+        }
+    }
+
+    /**
+     * Proses satu paket yang sudah dipastikan berada di urutan yang benar:
+     * heartbeat (payload kosong) hanya dicatat, paket audio didecode.
+     */
+    private void dispatchPacket(PacketInfo info) {
         if (info.payload.length == 0) {
-            // Heartbeat - tidak ada audio untuk didecode
             heartbeatsSeen.incrementAndGet();
             if (config.isVerboseLogging()) {
                 AppLogger.debug("Heartbeat diterima: seq=" + info.sequenceNumber);
@@ -282,7 +413,28 @@ public final class ClientEngine {
 
         if (config.isVerboseLogging() && packetsReceived.get() % 100 == 0) {
             AppLogger.debug("Processed " + packetsReceived.get() + " packets, "
-                + samplesDecoded.get() + " samples decoded");
+                + samplesDecoded.get() + " samples decoded, "
+                + concealedFrames.get() + " concealed");
+        }
+    }
+
+    /**
+     * Concealment untuk satu frame yang hilang permanen. Dibuat dengan
+     * membangun payload sintetis berisi kode netral (CONCEALMENT_CODE) lalu
+     * mengumpankannya lewat decodeAndOutput() YANG SAMA dengan paket asli -
+     * supaya logika skip-sync-tone (samplesToSkip) tetap konsisten walau ada
+     * paket yang hilang di awal sesi (saat sync tone masih dibuang).
+     */
+    private void concealMissingFrame() {
+        int bytesPerFrame = audioConfig.getAdpcmBytesPerFrame();
+        byte[] concealedPayload = new byte[bytesPerFrame];
+        byte concealedByte = (byte) ((CONCEALMENT_CODE << 4) | CONCEALMENT_CODE);
+        java.util.Arrays.fill(concealedPayload, concealedByte);
+
+        decodeAndOutput(concealedPayload);
+
+        if (config.isVerboseLogging()) {
+            AppLogger.debug("Frame hilang di-conceal (seq=" + nextExpectedSeq + ")");
         }
     }
 
@@ -356,9 +508,11 @@ public final class ClientEngine {
     private void printStats() {
         long uptime = System.currentTimeMillis() - startTime;
         AppLogger.info(String.format(
-            "Stats: uptime=%ds, packets=%d, heartbeats=%d, malformed=%d, samples=%d | %s",
+            "Stats: uptime=%ds, packets=%d, heartbeats=%d, malformed=%d, "
+                + "concealed=%d, samples=%d, bufferDepth=%d | %s",
             uptime / 1000, packetsReceived.get(), heartbeatsSeen.get(),
-            malformedPackets.get(), samplesDecoded.get(), qosMetrics.toString()));
+            malformedPackets.get(), concealedFrames.get(), samplesDecoded.get(),
+            jitterBuffer.size(), qosMetrics.toString()));
     }
 
     // =========================================================================
@@ -369,6 +523,7 @@ public final class ClientEngine {
     public int getPacketsReceived()     { return packetsReceived.get();    }
     public int getHeartbeatsSeen()      { return heartbeatsSeen.get();     }
     public int getMalformedPackets()    { return malformedPackets.get();   }
+    public int getConcealedFrames()     { return concealedFrames.get();    }
     public long getSamplesDecoded()     { return samplesDecoded.get();     }
     public QosMetrics getQosMetrics()   { return qosMetrics;               }
 }

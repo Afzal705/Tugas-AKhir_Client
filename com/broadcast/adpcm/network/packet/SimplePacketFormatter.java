@@ -14,7 +14,7 @@ package com.broadcast.adpcm.network.packet;
  */
 public final class SimplePacketFormatter {
     
-    public static final int HEADER_SIZE = 14;  // 8 + 4
+    public static final int HEADER_SIZE = 12;  // 8 + 4
     public static final int MAX_PAYLOAD = 65507 - HEADER_SIZE;
     
     private SimplePacketFormatter() {
