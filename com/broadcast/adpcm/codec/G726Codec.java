@@ -36,9 +36,10 @@ public final class G726Codec {
      */
     public static int encode(int pcm16, G726State state) {
 
-        // Blok 1: scale input 16-bit → 13-bit
-        // G.726 beroperasi pada range [-4096, 4095]
-        int sl = pcm16 >> 3;
+        // Blok 1: scale input 16-bit → 14-bit
+        // Referensi Sun g72x.c/g721.c: "sl >>= 2" (14-bit dynamic range),
+        // BUKAN >>3 (versi sebelumnya salah skala ke 13-bit)
+        int sl = pcm16 >> 2;
 
         // Blok 6: hitung sinyal prediksi se dari state sebelumnya
         int sezi = predictorZero(state);   // kontribusi filter FIR (b[])
@@ -63,7 +64,7 @@ public final class G726Codec {
 
         // Blok 6,7,8,9: update seluruh state untuk sampel berikutnya
         int dqsez = sr + sez - se;
-        update(y, G726Tables.WI_TABLE[I], G726Tables.FI_TABLE[I],
+        update(y, G726Tables.WI_TABLE[I] << 5, G726Tables.FI_TABLE[I],
                dq, sr, dqsez, state);
 
         return I;
@@ -89,6 +90,8 @@ public final class G726Codec {
      */
     public static int decode(int code, G726State state) {
         int I = code & 0xF;
+        // (skala output nanti di baris "pcm16 = sr << 2" — simetris dengan
+        // "sl = pcm16 >> 2" di encode())
 
         // Blok 6: prediksi (identik dengan encode)
         int sezi = predictorZero(state);
@@ -108,11 +111,12 @@ public final class G726Codec {
 
         // Blok 6,7,8,9: update state — WAJIB identik urutannya dengan encode
         int dqsez = sr + sez - se;
-        update(y, G726Tables.WI_TABLE[I], G726Tables.FI_TABLE[I],
+        update(y, G726Tables.WI_TABLE[I] << 5, G726Tables.FI_TABLE[I],
                dq, sr, dqsez, state);
 
-        // Inverse Blok 1: skala 13-bit kembali ke 16-bit
-        int pcm16 = sr << 3;
+        // Inverse Blok 1: skala 14-bit kembali ke 16-bit
+        // Referensi: "return (sr << 2);" — simetris dengan encode "sl = pcm16 >> 2"
+        int pcm16 = sr << 2;
         return Math.max(-32768, Math.min(32767, pcm16));
     }
 
@@ -192,7 +196,12 @@ public final class G726Codec {
         int dl   = (exp << 7) + mant;
         int dln  = dl - (y >> 2);
         int i    = search(dln, G726Tables.QTAB_32, 7);
-        return (d < 0) ? (15 - i) : i;
+        // Referensi Sun g72x.c (revisi 1988): magnitude granular terkecil
+        // (i==0) untuk d>=0 WAJIB dipetakan ke kode 15, bukan 0 - kode 0
+        // secara desain tidak pernah dihasilkan quantize() untuk sinyal nyata.
+        if (d < 0)       return 15 - i;
+        else if (i == 0) return 15;
+        else             return i;
     }
 
     // =========================================================
@@ -250,46 +259,83 @@ public final class G726Codec {
                                 int dq, int sr, int dqsez,
                                 G726State s) {
 
+        int pk0 = (dqsez < 0) ? 1 : 0;
+        int mag = dq & 0x7FFF;
+
+        // (TRANS) Deteksi transisi data/modem vs suara — dipakai untuk
+        // memutuskan apakah predictor harus di-reset paksa ke nol.
+        // Referensi: Sun g72x.c update(), blok TRANS.
+        int ylint  = (int) (s.yl >> 15);
+        int ylfrac = (int) ((s.yl >> 10) & 0x1F);
+        int thr1   = (32 + ylfrac) << ylint;
+        int thr2   = (ylint > 9) ? (31 << 10) : thr1;
+        int dqthr  = (thr2 + (thr2 >> 1)) >> 1;
+        boolean tr;
+        if      (s.td == 0)   tr = false;
+        else if (mag <= dqthr) tr = false;
+        else                   tr = true;
+
         // (a) Scale factor adaptation
         // yu: fast — (1 - 2^-5)*yu + 2^-5*W(I)
-        int yuv = s.yu + ((wi - s.yu) >> 5);
+        int yuv = y + ((wi - y) >> 5);
         s.yu = Math.max(544, Math.min(5120, yuv));
-        // yl: slow — konvergen ke 64*yu dengan konstanta waktu ~60 sampel
-        s.yl += s.yu - ((s.yl + (s.yl >> 4) + 32L) >> 6);
-
-        // (b) Adaptation speed control
-        int fiv = fi & 0x7FFF;
-        s.dms += (fiv - s.dms) >> 5;   // short-term average F(I)
-        s.dml += (fiv - s.dml) >> 7;   // long-term average F(I)
-        if      (s.td != 0)          s.ap += (-s.ap) >> 5;
-        else if (s.dms < s.dml)      s.ap += (0x200 - s.ap) >> 5;
-        else                         s.ap += (-s.ap) >> 5;
-        s.ap = Math.max(0, Math.min(256, s.ap));
-
-        // (c) Tone detector
-        s.td = (s.a[1] < -11776) ? 1 : 0;
+        // yl: slow — konvergen ke 64*yu
+        s.yl += s.yu + ((-s.yl) >> 6);
 
         // (d) Adaptive predictor — koefisien a[] (poles / IIR)
-        int pk0 = (dqsez < 0) ? 1 : 0;
+        // Port setia dari Sun g72x.c: blok UPA2 (a[1]) WAJIB pakai logika
+        // LIMC (pembatas kestabilan 3-cabang) di bawah ini — versi
+        // sebelumnya memakai rumus leaky-integrator sederhana yang TIDAK
+        // punya mekanisme kestabilan ini, menyebabkan predictor runaway
+        // tak terkendali untuk sinyal nyata (voice) sampai saturasi penuh.
+        int pks1 = pk0 ^ s.pk[0];
+        int a2p;
+        if (tr) {
+            // Sinyal terdeteksi sebagai data/modem: reset predictor
+            s.a[0] = 0;
+            s.a[1] = 0;
+            for (int i = 0; i < 6; i++) s.b[i] = 0;
+            a2p = 0;
+        } else {
+            // UPA2: update a[1]
+            a2p = s.a[1] - (s.a[1] >> 7);
+            if (dqsez != 0) {
+                int fa1 = (pks1 != 0) ? s.a[0] : -s.a[0];
+                if      (fa1 < -8191) a2p -= 0x100;
+                else if (fa1 >  8191) a2p += 0xFF;
+                else                  a2p += fa1 >> 5;
 
-        int fa1 = ((pk0 ^ s.pk[0]) != 0) ? -192 : 192;
-        int a1t = s.a[0] + fa1 - (Math.abs(s.a[0]) >> 8);
-        s.a[0]  = Math.max(-12288, Math.min(12288, a1t));
+                // LIMC — pembatas kestabilan pole a[1]
+                if ((pk0 ^ s.pk[1]) != 0) {
+                    if      (a2p <= -12160) a2p = -12288;
+                    else if (a2p >=  12416) a2p =  12288;
+                    else                    a2p -= 0x80;
+                } else {
+                    if      (a2p <= -12416) a2p = -12288;
+                    else if (a2p >=  12160) a2p =  12288;
+                    else                    a2p += 0x80;
+                }
+            }
+            s.a[1] = a2p;
 
-        int fa2 = ((pk0 ^ s.pk[1]) != 0) ? -128 : 128;
-        int a2t = s.a[1] + fa2 - (Math.abs(s.a[1]) >> 7);
-        int lim = 32576 - Math.abs(s.a[0]);
-        s.a[1]  = Math.max(-lim, Math.min(lim, a2t));
+            // UPA1: update a[0]
+            s.a[0] -= s.a[0] >> 8;
+            if (dqsez != 0) {
+                if (pks1 == 0) s.a[0] += 192;
+                else           s.a[0] -= 192;
+            }
+            // LIMD — batas a[0] bergantung pada a[1] yang baru diperbarui
+            int a1ul = 15360 - a2p;
+            s.a[0] = Math.max(-a1ul, Math.min(a1ul, s.a[0]));
 
-        // (d) Adaptive predictor — koefisien b[] (zeros / FIR)
-        // tanda dq: dq < 0 karena representasi signed-magnitude Sun
-        int sgdq = (dq < 0) ? 1 : 0;
-        for (int i = 0; i < 6; i++) {
-            // tanda dq[i] tersimpan di bit-10 format floatConv
-            int sgdqi = ((s.dq[i] & 0x400) != 0) ? 1 : 0;
-            int step  = (sgdq == sgdqi) ? 128 : -128;
-            int bi    = s.b[i] + step - (Math.abs(s.b[i]) >> 8);
-            s.b[i]    = Math.max(-32768, Math.min(32767, bi));
+            // UPB: update koefisien b[] (zeros / FIR)
+            for (int i = 0; i < 6; i++) {
+                s.b[i] -= s.b[i] >> 8;
+                if ((dq & 0x7FFF) != 0) {
+                    if ((dq ^ s.dq[i]) >= 0) s.b[i] += 128;
+                    else                     s.b[i] -= 128;
+                }
+            }
         }
 
         // Shift register: simpan riwayat dq, sr, pk
@@ -299,6 +345,22 @@ public final class G726Codec {
         s.sr[0] = floatConv(sr);
         s.pk[1] = s.pk[0];
         s.pk[0] = pk0;
+
+        // (c) Tone detector — dievaluasi SETELAH predictor diperbarui,
+        // dan dilewati (dipaksa 0) saat mode data/modem terdeteksi
+        if      (tr)             s.td = 0;
+        else if (a2p < -11776)   s.td = 1;
+        else                     s.td = 0;
+
+        // (b) Adaptation speed control
+        s.dms += (fi - s.dms) >> 5;          // short-term average F(I)
+        s.dml += ((fi << 2) - s.dml) >> 7;   // long-term average F(I)
+        if      (tr)                                                  s.ap += (0x200 - s.ap) >> 4;
+        else if (y < 1536)                                            s.ap += (0x200 - s.ap) >> 4;
+        else if (s.td == 1)                                           s.ap += (0x200 - s.ap) >> 4;
+        else if (Math.abs((s.dms << 2) - s.dml) >= (s.dml >> 3))      s.ap += (0x200 - s.ap) >> 4;
+        else                                                           s.ap += (-s.ap) >> 4;
+        s.ap = Math.max(0, Math.min(256, s.ap));
     }
 
     // =========================================================
