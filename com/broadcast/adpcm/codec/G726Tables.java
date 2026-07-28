@@ -175,7 +175,7 @@ public final class G726Tables {
     public static final int AP_MIN = 0;
 
     /** Batas atas adaptation speed ap */
-    public static final int AP_MAX = 256;
+    public static final int AP_MAX = 512;
 
     /** Ambang batas deteksi nada: a[1] < -11776 → tone detected */
     public static final int TONE_THRESHOLD = -11776;

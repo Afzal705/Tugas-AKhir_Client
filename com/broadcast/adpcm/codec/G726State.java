@@ -213,8 +213,9 @@ public final class G726State {
 
         // Cek koefisien poles a[]
         // a[0] dibatasi ±12288, a[1] dibatasi ±32576
-        if (Math.abs(a[0]) > 12288) return false;
-        if (Math.abs(a[1]) > 32576) return false;
+        if (Math.abs(a[1]) > 12288) return false;
+        int a1ul = 15360 - a[1];
+        if (a[0] < -a1ul || a[0] > a1ul) return false;
 
         // Cek koefisien zeros b[]
         // b[] adalah Q15, range ±32767
@@ -226,24 +227,16 @@ public final class G726State {
         // Struktur valid: bit[10]=tanda, bit[9:6]=exp(0-15), bit[5:0]=mantissa(32-63)
         // Nilai valid: 0x020–0x3FF (positif) atau 0x420–0x7FF (negatif)
         // Nilai 32 (0x020) adalah representasi nol yang valid
-        for (int i = 0; i < 6; i++) {
-            int val     = dq[i];
-            int sign    = (val >> 10) & 1;       // bit 10: tanda
-            int exp     = (val >> 6) & 0xF;      // bit 9-6: eksponent (0-15)
-            int mant    = val & 0x3F;             // bit 5-0: mantissa (32-63)
-            int invalid = val & ~0x7FF;           // bit di atas 10 harus 0
-
-            if (invalid != 0) return false;       // ada bit tidak valid
-            if (mant < 32 || mant > 63) return false; // mantissa di luar range
+         for (int i = 0; i < 6; i++) {
+            int low10 = dq[i] & 0x3FF;   // bit[9:0] = eksponen(4) + mantissa(6)
+            int mant  = low10 & 0x3F;
+            if (mant < 32 || mant > 63) return false;
         }
 
-        // Cek sr[] — format internal floating-point, sama dengan dq[]
+        // Cek sr[] — sama dengan dq[]
         for (int i = 0; i < 2; i++) {
-            int val     = sr[i];
-            int mant    = val & 0x3F;
-            int invalid = val & ~0x7FF;
-
-            if (invalid != 0) return false;
+            int low10 = sr[i] & 0x3FF;
+            int mant  = low10 & 0x3F;
             if (mant < 32 || mant > 63) return false;
         }
 
