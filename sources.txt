@@ -16,5 +16,6 @@
 "C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/network/packet/SimplePacketFormatter.java"
 "C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/network/udp/UDPBroadcastReceiver.java"
 "C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/network/udp/UDPBroadcastSender.java"
+"C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/tools/OfflineDecoder.java"
 "C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/util/ADPCMUtils.java"
 "C:/Users/LENOVO/PUNYA AFZAL/projek semester 8/Implementasi/0Skripsi/Client/src/com/broadcast/adpcm/util/AppLogger.java"
